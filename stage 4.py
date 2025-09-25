@@ -5,174 +5,101 @@ from gurobipy import GRB
 # Input: jobs, machines, ordered routes
 # -----------------------------
 routes = {
-    1: [(1, 3), (2, 2)],   # Job 1: M1(3) -> M2(2)
-    2: [(2, 2), (1, 4)]    # Job 2: M2(2) -> M1(4)
+   1: [(5,0.65), (3,0.514), (7,0.64), (2,0.202), (1,0.202), (4,0.24), (6,0.29)],
+    2: [(3,0.722), (2,0.338), (1,0.242), (8,0.242), (7,0.2), (4,0.2), (6,0.338), (5,0.578)],
+    3: [(2,0.089), (6,0.117), (1,0.185), (3,0.485), (5,0.185), (8,0.369), (4,0.117), (7,0.089)],
+    4: [(6,0.061), (2,0.061), (5,0.265), (3,0.025), (1,0.013), (4,0.025)],
+    5: [(5,0.392), (6,0.128), (2,0.05), (3,0.128), (1,0.072), (4,0.072)],
+    6: [(2,0.02), (5,0.244), (4,0.052), (3,0.052), (1,0.052), (6,0.01)],
+    7: [(5,0.269), (4,0.185), (6,0.06), (2,0.065), (1,0.029), (7,0.029), (3,0.017)],
+    8: [(3,0.074), (5,0.074), (2,0.034), (1,0.034), (4,0.29), (6,0.02)]
 }
 jobs = list(routes.keys())
 machines = sorted({m for ops in routes.values() for (m, _) in ops})
-K = sum(len(ops) for ops in routes.values())  # total operations
-S = K  # number of stage slots allowed
-
-# safe Big-M
-total_proc = sum(p for ops in routes.values() for (_, p) in ops)
-M = total_proc
+K = sum(len(ops) for ops in routes.values())
 
 # -----------------------------
 # Model
 # -----------------------------
-model = gp.Model("para_mdp_multiperstage_precedence_with_wait")
+model = gp.Model("para_mdp")
 
-# Theta[k,m] for k in 0..S
-Theta = model.addVars(range(S+1), machines, lb=0.0, name="Theta")
+# Theta[k,m]: machine availability
+Theta = model.addVars(range(K+1), machines, lb=0, name="Theta")
 
-# eta[k,i,t] = 1 if job i, operation t is placed in stage k
-eta = model.addVars(
-    [(k,i,t) for k in range(S) for i in jobs for t in range(len(routes[i]))],
-    vtype=GRB.BINARY, name="eta"
-)
+# eta[k,i,t]: binary, 1 if job i's operation t scheduled at stage k
+ops = [(i,t) for i in jobs for t in range(len(routes[i]))]
+eta = model.addVars(range(K), ops, vtype=GRB.BINARY, name="eta")
 
-# makespan
-Cmax = model.addVar(lb=0.0, name="Cmax")
-
-# waiting variables W[i,t] between op t and t+1
-W = {}
-for i in jobs:
-    for t in range(len(routes[i]) - 1):
-        W[i, t] = model.addVar(lb=0.0, name=f"W_{i}_{t}")
-
-# job completion variables
-Cjob = {i: model.addVar(lb=0.0, name=f"Cjob_{i}") for i in jobs}
-
-model.update()
+# Makespan
+Cmax = model.addVar(lb=0, name="Cmax")
 
 # -----------------------------
 # Constraints
 # -----------------------------
 
-# Theta[0,m] = 0
-for m in machines:
-    model.addConstr(Theta[0, m] == 0.0)
+# (1) One operation scheduled per stage
+for k in range(K):
+    model.addConstr(gp.quicksum(eta[k,i,t] for (i,t) in ops) == 1)
 
-# Machine capacity per stage
-for k in range(S):
+# (2) Each operation executed exactly once
+for (i,t) in ops:
+    model.addConstr(gp.quicksum(eta[k,i,t] for k in range(K)) == 1)
+
+# (3) Theta recursion: machine availability
+for k in range(K):
     for m in machines:
         model.addConstr(
-            gp.quicksum(eta[k, i, t]
-                        for i in jobs for t in range(len(routes[i]))
-                        if routes[i][t][0] == m) <= 1
+            Theta[k+1,m] >= Theta[k,m] +
+            gp.quicksum(routes[i][t][1]*eta[k,i,t] for (i,t) in ops if routes[i][t][0]==m)
         )
 
-# Each op executed exactly once
+# (4) Makespan
+for (i,t) in ops:
+    m = routes[i][t][0]
+    model.addConstr(Cmax >= Theta[K,m])
+
+# (5) Precedence constraints: operation t cannot start before t-1 is done
 for i in jobs:
-    for t in range(len(routes[i])):
-        model.addConstr(gp.quicksum(eta[k, i, t] for k in range(S)) == 1)
-
-# Theta recursion
-for k in range(S):
-    for m in machines:
-        model.addConstr(
-            Theta[k + 1, m] >= Theta[k, m] +
-            gp.quicksum(routes[i][t][1] * eta[k, i, t]
-                        for i in jobs for t in range(len(routes[i]))
-                        if routes[i][t][0] == m)
-        )
-
-# Makespan lower bound
-for m in machines:
-    model.addConstr(Cmax >= Theta[S, m])
+    for t in range(1, len(routes[i])):  # start from second operation
+        for k2 in range(K):
+            model.addConstr(
+                gp.quicksum(eta[k1, i, t-1] for k1 in range(k2+1)) 
+                >= eta[k2, i, t]
+            )
 
 # -----------------------------
-# Exact precedence with Big-M
+# Objective
 # -----------------------------
-for i in jobs:
-    for t in range(len(routes[i]) - 1):
-        m1 = routes[i][t][0]
-        m2 = routes[i][t+1][0]
-        for k1 in range(S):
-            for k2 in range(S):
-                model.addConstr(
-                    Theta[k2, m2] + M * (2 - eta[k1, i, t] - eta[k2, i, t+1])
-                    >= Theta[k1 + 1, m1]
-                )
-
-# -----------------------------
-# Waiting linearization
-# -----------------------------
-for i in jobs:
-    for t in range(len(routes[i]) - 1):
-        m1 = routes[i][t][0]
-        m2 = routes[i][t+1][0]
-        for k1 in range(S):
-            for k2 in range(S):
-                model.addConstr(
-                    W[i, t] + M * (2 - eta[k1, i, t] - eta[k2, i, t+1])
-                    >= Theta[k2, m2] - Theta[k1 + 1, m1]
-                )
-
-# -----------------------------
-# Job completion
-# -----------------------------
-for i in jobs:
-    last = len(routes[i]) - 1
-    m_last = routes[i][last][0]
-    for k in range(S):
-        model.addConstr(
-            Cjob[i] + M * (1 - eta[k, i, last]) >= Theta[k + 1, m_last]
-        )
-    model.addConstr(Cmax >= Cjob[i])
-
-# -----------------------------
-# Objective: weighted sum
-# -----------------------------
-w1 = 1.0   # weight for makespan
-w2 = 0.1   # weight for sum of job completion times
-w3 = 0.05  # weight for waiting times
-
-obj = (
-    w1 * Cmax
-    + w2 * gp.quicksum(Cjob[i] for i in jobs)
-    + w3 * gp.quicksum(W[i, t] for i in jobs for t in range(len(routes[i]) - 1))
-)
-
-model.setObjective(obj, GRB.MINIMIZE)
+model.setObjective(Cmax, GRB.MINIMIZE)
 
 # -----------------------------
 # Solve
 # -----------------------------
-model.Params.OutputFlag = 1
 model.optimize()
 
 # -----------------------------
-# Print solution
+# Display results
 # -----------------------------
 if model.status == GRB.OPTIMAL:
     print("\nOptimal solution found:")
-    print(f"Objective = {model.objVal:.3f}, Cmax = {Cmax.X:.3f}\n")
+    print(f"Makespan (Cmax) = {model.objVal}")
+    print("\nSchedule:")
 
-    print("Schedule (stage -> operations):")
-    for k in range(S):
-        scheduled = []
-        for i in jobs:
-            for t in range(len(routes[i])):
-                if eta[k, i, t].X > 0.5:
-                    scheduled.append((i, t, routes[i][t][0], routes[i][t][1]))
-        if scheduled:
-            print(f" Stage {k+1}: ", end="")
-            print(", ".join(f"Job{job}-Op{op+1} (M{m}, p={p})"
-                            for job, op, m, p in scheduled))
+    # Iterate through each stage and identify the scheduled operation
+    for k in range(K):
+        for (i, t) in ops:
+            if eta[k, i, t].X > 0.5:
+                job_id = i
+                op_index = t
+                machine_id = routes[job_id][op_index][0]
+                processing_time = routes[job_id][op_index][1]
+                print(f"Stage {k+1}: Job {job_id}'s operation {op_index+1} on Machine {machine_id} for {processing_time} units")
 
-    print("\nTheta table:")
-    for k in range(S+1):
+    print("\nMachine busy times (Theta):")
+    for k in range(K + 1):
         for m in machines:
-            print(f" Theta[{k},{m}] = {Theta[k,m].X:.1f}")
-
-    print("\nWaiting W[i,t]:")
-    for i in jobs:
-        for t in range(len(routes[i]) - 1):
-            print(f" W[{i},{t}] = {W[i,t].X:.3f}")
-
-    print("\nJob completion Cjob[i]:")
-    for i in jobs:
-        print(f" Cjob[{i}] = {Cjob[i].X:.3f}")
+            if Theta[k, m].X > 0:
+                print(f"Theta[{k}, {m}] = {Theta[k, m].X}")
 else:
-    print("No optimal solution found. Status:", model.status)
+    print("\nNo optimal solution found.")
+    print(f"Status code: {model.status}")
